@@ -1,0 +1,57 @@
+# ==============================================================================
+# Chirpify Analytics Ingestion Service — Production Multi-Stage Dockerfile
+# ==============================================================================
+# Stage 1: Build & Dependency Wheel Compilation
+# ==============================================================================
+FROM python:3.12-slim AS builder
+
+WORKDIR /build
+
+# Install build dependencies required for compiling C-extensions (e.g. psycopg2)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Leverage Docker cache: install dependencies first
+COPY requirements.txt .
+RUN pip install --no-cache-dir --user -r requirements.txt
+
+# ==============================================================================
+# Stage 2: Final Minimal Runtime Image
+# ==============================================================================
+FROM python:3.12-slim AS runner
+
+# Create dedicated non-root user (Principle of Least Privilege)
+RUN groupadd -g 10001 chirpify && \
+    useradd -u 10001 -g chirpify -s /bin/bash -m chirpify
+
+# Install minimal runtime libraries (libpq5 for PostgreSQL client connectivity)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy installed Python packages from builder stage
+COPY --from=builder /root/.local /home/chirpify/.local
+ENV PATH="/home/chirpify/.local/bin:${PATH}"
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# Copy application source code with non-root ownership
+COPY --chown=chirpify:chirpify src/ /app/src/
+
+# Switch to non-root user
+USER chirpify
+
+# Expose internal API port
+EXPOSE 8000
+
+# Docker Healthcheck to verify container liveness
+HEALTHCHECK --interval=15s --timeout=3s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/healthz || exit 1
+
+# Graceful termination execution form
+CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--no-access-log"]
