@@ -11,6 +11,11 @@ help:
 	@echo "  make down          Stop local stack and remove volumes"
 	@echo "  make logs          View aggregated logs from Docker Compose"
 	@echo "  make lint          Check code style and quality with ruff"
+	@echo "  make floci-start   Launch local Floci cloud emulator (AWS on 4566)"
+	@echo "  make floci-stop    Stop local Floci cloud emulator"
+	@echo "  make tf-init       Initialize Terraform modules and providers"
+	@echo "  make tf-validate   Validate Terraform configuration syntax"
+	@echo "  make tf-plan       Run Terraform plan against Floci or AWS"
 	@echo "  make clean         Remove cache and temporary build files"
 
 install:
@@ -36,6 +41,21 @@ logs:
 
 lint:
 	python -m ruff check src/ tests/
+
+floci-start:
+	floci start
+
+floci-stop:
+	floci stop
+
+tf-init:
+	powershell -NoProfile -Command "cd terraform/environments/dev; terraform init"
+
+tf-validate:
+	powershell -NoProfile -Command "cd terraform/environments/dev; terraform validate"
+
+tf-plan:
+	powershell -NoProfile -Command "cd terraform/environments/dev; terraform plan"
 
 clean:
 	find . -type d -name "__pycache__" -exec rm -rf {} +

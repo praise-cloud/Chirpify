@@ -1,0 +1,13 @@
+# ==============================================================================
+# Chirpify Analytics Platform — Development Variable Values
+# ==============================================================================
+aws_region       = "us-east-1"
+project_name     = "chirpify"
+environment      = "dev"
+
+# Set to true when running local Floci emulator (floci start) on port 4566
+# Set to false when deploying to real AWS cloud
+use_local_floci  = true
+floci_endpoint   = "http://localhost:4566"
+
+db_password      = "chirpify_secure_pass_2026"
