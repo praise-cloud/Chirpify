@@ -1,0 +1,42 @@
+# ==============================================================================
+# Chirpify Analytics Worker Service — Production Multi-Stage Dockerfile
+# ==============================================================================
+# Stage 1: Build & Wheel Compilation
+# ==============================================================================
+FROM python:3.12-slim AS builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --user -r requirements.txt
+
+# ==============================================================================
+# Stage 2: Final Minimal Runtime Image
+# ==============================================================================
+FROM python:3.12-slim AS runner
+
+RUN groupadd -g 10001 chirpify && \
+    useradd -u 10001 -g chirpify -s /bin/bash -m chirpify
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /root/.local /home/chirpify/.local
+ENV PATH="/home/chirpify/.local/bin:${PATH}"
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+COPY --chown=chirpify:chirpify src/ /app/src/
+
+USER chirpify
+
+# Signal-aware command execution
+CMD ["python", "-m", "src.worker.consumer"]

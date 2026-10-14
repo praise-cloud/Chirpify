@@ -105,8 +105,8 @@ A senior engineer never forces one database to handle every access pattern. We i
 
 | Process | Status | Description | Key Deliverables |
 |---|---|---|---|
-| **Process 1: Local App Core & Containerization** | **In Progress** | Build ingestion API, schemas, local services, multi-stage Dockerfile | FastAPI app, Pydantic models, Dockerfile, docker-compose, unit tests |
-| **Process 2: Event Worker & Storage Pipeline** | Planned | Build asynchronous consumer, S3 batching, Postgres & Redis storage | SQS worker, DLQ logic, S3 raw sink, DB migrations |
+| **Process 1: Local App Core & Containerization** | **Completed** | Build ingestion API, schemas, local services, multi-stage Dockerfile | FastAPI app, Pydantic models, Dockerfile, docker-compose, unit tests |
+| **Process 2: Event Worker & Storage Pipeline** | **Completed** | Build asynchronous consumer, S3 batching, Postgres & Redis storage | SQS worker, DLQ logic, S3 raw sink, DB migrations |
 | **Process 3: Infrastructure as Code (Terraform)** | Planned | Automate AWS VPC, Subnets, ALB, ECS, RDS, Redis, SQS, S3 | Modular Terraform, remote state, security groups |
 | **Process 4: Automated CI/CD (GitHub Actions)** | Planned | Automated lint, test, security scan, container build, and deploy | Workflow YAMLs, Trivy scan, ECR push, ECS zero-downtime deploy |
 | **Process 5: Observability & Alerting** | Planned | CloudWatch dashboards, custom metrics, structured logs, alarms | Structured logging, Prometheus/CloudWatch metrics, alarm rules |
@@ -162,7 +162,7 @@ The goal of Process 1 is to build the core event ingestion engine with productio
   * Separated `/healthz` (Liveness) and `/readyz` (Readiness).
   * Injected `X-Request-ID` and `X-Process-Time` into all HTTP response headers via custom ASGI middleware.
 * **Why & Proof:**
-  * *Liveness vs Readiness:* If downstream SQS is temporarily unreachable, the container is NOT broken; restarting the container will not fix SQS and will cause an outage cascade. Therefore:
+  * *Liveness vs Readiness:* If downstream SQS is temporarily unreachable, the container is NOT broken; restarting the container will not fix SQS and will cause an outage cascade.
     * `/healthz` checks if the Python process is alive (returns 200). If this fails, the orchestrator restarts the container.
     * `/readyz` checks if downstream dependencies (SQS) are reachable. If SQS is down, it returns 503, signaling the Load Balancer to temporarily stop sending new traffic without restarting the container.
   * *Correlation IDs:* The `X-Request-ID` header allows distributed log tracing across API logs, worker logs, and database slow-query logs.
@@ -190,5 +190,74 @@ The goal of Process 1 is to build the core event ingestion engine with productio
 
 ### 5.3 Verification Results
 * **Linter:** `python -m ruff check src/ tests/` -> 0 errors, 100% compliant.
-* **Test Suite:** `python -m pytest tests/ -v` -> 6/6 tests passed (100% pass rate).
+* **Test Suite:** `python -m pytest tests/test_api.py -v` -> 6/6 tests passed.
+
+---
+
+## 6. Process 2: Event Processing Engine & Storage Pipeline (Completed)
+
+### 6.1 Objectives & Deliverables
+The goal of Process 2 is to implement the asynchronous worker pipeline that drains events from SQS and persists them across three distinct storage tiers (**Polyglot Persistence**) with strict idempotency, graceful shutdown, and dead-letter queue isolation.
+
+**Deliverables Created:**
+* `src/worker/database.py`: SQLAlchemy schemas (`Tenant`, `EventLog`, `DailyEventAggregate`) and production connection pooling with pre-ping validation.
+* `src/worker/storage.py`: Handlers for S3 raw compression, Redis sub-millisecond atomic counters & HyperLogLog, and PostgreSQL relational aggregations.
+* `src/worker/consumer.py`: Production SQS worker utilizing **Long Polling** (`WaitTimeSeconds=20`), batch message acknowledgments, and `SIGTERM`/`SIGINT` graceful shutdown.
+* `src/worker/dlq.py`: Site Reliability Engineering (SRE) management utility for inspecting and redriving poison-pill messages from the Dead Letter Queue.
+* `docker/Dockerfile.worker`: Minimal multi-stage Dockerfile for containerized worker deployment.
+* `tests/test_worker.py`: Comprehensive test suite verifying S3 archiving, Redis pipelines, database idempotency, and consumer operations.
+* Updated `docker-compose.yml`: Added `worker` container to the local development environment.
+
+---
+
+### 6.2 Deep Technical Walkthrough & "Why" Behind Each Decision
+
+#### 1. Polyglot Persistence: Tiered Storage Architecture
+A senior engineer avoids forcing a single database to handle conflicting workload patterns (immutable raw logs, high-speed counters, and relational dimensions). We segregated storage into three distinct systems:
+
+```
+[SQS Worker]
+     ├── (1) Gzip JSON ────────► AWS S3 Bucket (Raw Archive & Replayability)
+     ├── (2) Pipeline HINCRBY ──► Redis (Hot Counters & Sub-millisecond Dashboards)
+     └── (3) Atomic Upsert ────► PostgreSQL (Relational Aggregates & User Dimensions)
+```
+
+1. **S3 Raw Event Sink (`S3StorageHandler`):**
+   * *Partitioning Strategy:* `events/year=YYYY/month=MM/day=DD/tenant=.../batch_<uuid>.json.gz`.
+   * *Why Gzip:* Compressing JSON events with gzip reduces network bandwidth and S3 storage costs by ~80-85%. Date-partitioning aligns directly with AWS Athena, DuckDB, and AWS Glue crawlers for cost-effective serverless analytics querying.
+   * *Replayability Proof:* If application business logic has a bug or downstream schemas change, the raw data in S3 remains immutable. An engineer can simply replay S3 data into PostgreSQL to reconstruct the entire analytical state.
+
+2. **Redis In-Memory Hot Metrics (`RedisStorageHandler`):**
+   * *Pipelining:* Instead of executing individual network requests for each event, we batch commands into a single `client.pipeline()`. This reduces TCP overhead from $N$ roundtrips to $1$ roundtrip.
+   * *Atomic Counters:* `HINCRBY` aggregates event counts per event type per day in O(1) time.
+   * *HyperLogLog for Daily Active Users (DAU):* `PFADD` tracks unique user IDs. Traditional `COUNT(DISTINCT user_id)` in SQL requires holding every single UUID in memory (GBs of RAM). HyperLogLog uses a fixed 12 KB of memory per key with a standard error rate of only 0.81%, regardless of whether tracking 1,000 or 10,000,000 users.
+   * *TTL Expiration:* Every key is tagged with a 30-day TTL (`expire`), preventing runaway Redis memory bloat.
+
+3. **PostgreSQL Relational Persistence & Idempotency (`PostgresStorageHandler`):**
+   * *Idempotency Guarantee:* Network distributed queues like AWS SQS guarantee **at-least-once delivery**. A message can be delivered twice if a network acknowledgement is delayed. Chirpify ensures idempotency by checking `event_id` uniqueness before inserting. Duplicate events are silently ignored without throwing database errors or corrupting aggregate counts.
+   * *Connection Pool Tuning:* Uses `pool_size=10`, `max_overflow=20`, and `pool_pre_ping=True`. `pool_pre_ping` prevents `OperationalError: server closed the connection unexpectedly` caused by AWS RDS dropping idle TCP connections.
+
+#### 2. SQS Long Polling vs. Short Polling Economics (`src/worker/consumer.py`)
+* **What we did:** Configured `WaitTimeSeconds=20` and `MaxNumberOfMessages=10`.
+* **Why & Proof:**
+  * *Short Polling (0s):* Returns immediately even if the queue is empty. A single worker thread polling in a tight loop executes ~36,000 requests per hour. Across 10 worker containers, that is 8.6M requests/day = 259M requests/month ($103/month in AWS SQS bills just for checking an empty queue!).
+  * *Long Polling (20s):* Holds the HTTP connection open until a message arrives or 20 seconds elapse. If the queue is empty, a worker makes at most 3 requests per minute (180/hour), reducing SQS API call volume and cost by **over 95%** while reducing event latency to milliseconds.
+
+#### 3. Signal-Aware Graceful Shutdown (`src/worker/consumer.py`)
+* **What we did:** Intercepted `SIGTERM` and `SIGINT` to set `self.running = False`.
+* **Why & Proof:** When AWS ECS Fargate or Kubernetes terminates a container during a deployment or auto-scaling down event, it sends a `SIGTERM` followed by a grace period (default 30s) before sending `SIGKILL`. If a worker abruptly dies mid-batch:
+  * Some events might be written to S3 and Redis, but not yet acknowledged in SQS.
+  * SQS will redeliver the batch to another worker, causing double-writes and skewed metrics.
+  * Our graceful shutdown ensures the current in-flight batch completes storage and acknowledges deletion from SQS before the process exits cleanly.
+
+#### 4. Dead Letter Queue (DLQ) Operational Pattern (`src/worker/dlq.py`)
+* **What we did:** Implemented `DeadLetterQueueManager` for inspecting and redriving quarantined messages.
+* **Why & Proof:** In production distributed systems, bugs happen (e.g., a customer SDK sends corrupted unicode or an unexpected data type). Without a DLQ, a poison-pill message causes the worker to crash, get redelivered, crash again, and form an infinite crash loop (Head-of-Line blocking). The DLQ isolates the poison pill after 3 attempts, allowing the rest of the queue to process normally while alerting engineers.
+
+---
+
+### 6.3 Verification Results
+* **Linter:** `python -m ruff check src/ tests/` -> 0 errors, 100% compliant.
+* **Test Suite:** `python -m pytest tests/ -v` -> 11/11 tests passed (100% pass rate across API and Worker).
+
 

@@ -38,6 +38,38 @@ services:
       - chirpify-net
 
   # ----------------------------------------------------------------------------
+  # Event Consumer Worker Service
+  # ----------------------------------------------------------------------------
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    container_name: chirpify-worker
+    restart: unless-stopped
+    environment:
+      - ENVIRONMENT=development
+      - LOG_LEVEL=INFO
+      - AWS_REGION=us-east-1
+      - AWS_ENDPOINT_URL=http://localstack:4566
+      - SQS_QUEUE_URL=http://localstack:4566/000000000000/chirpify-events-queue
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=chirpify_user
+      - POSTGRES_PASSWORD=chirpify_secure_pass
+      - POSTGRES_DB=chirpify_analytics
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      localstack:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - chirpify-net
+
+  # ----------------------------------------------------------------------------
   # LocalStack: Emulates AWS Cloud Services (SQS, S3) Locally
   # ----------------------------------------------------------------------------
   localstack:
